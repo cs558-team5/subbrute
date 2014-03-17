@@ -1,2 +1,10 @@
+wpi.edu
 apple.com
 rpi.edu
+cnn.com
+data.com
+spamhaus.com
+asp.iki.rssi
+home.joshfeinblum.com
+joshfeinblum.com
+iki.rssi

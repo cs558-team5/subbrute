@@ -13,6 +13,9 @@ import sys
 import random
 import dns.resolver
 from threading import Thread
+import commands
+import socket
+import time
 #support for python 2.7 and 3
 try:
     import queue
@@ -28,7 +31,7 @@ def create(n, constructor=list):
         yield constructor()
 
 class lookup(Thread):
-    def __init__(self, domains_for_thread, out_q, subdomains, wildcard = False, resolver_list = []):
+    def __init__(self, domains_for_thread, out_q, foundDC_q, subdomains, wildcard = False, resolver_list = []):
         Thread.__init__(self)
         self.out_q = out_q
         self.domains_for_thread = domains_for_thread
@@ -37,8 +40,8 @@ class lookup(Thread):
         self.resolver = dns.resolver.Resolver()
         self.subdomains = subdomains
         self.resolver.lifetime = 1.0
-        self.resolver.timeout = 0.5
-
+        self.resolver.Timeoutout = 0.5
+        self.foundDC_q = foundDC_q
 
         if len(self.resolver.nameservers):
             self.backup_resolver = self.resolver.nameservers
@@ -106,6 +109,39 @@ class lookup(Thread):
                 #     #dnspython threw some strange exception...
                 #     raise e
 
+    def check_DC(self, test):
+        # Check found domain for DC
+        command = 'nslookup -q=srv _ldap._tcp.dc._msdcs.'+test
+        result = commands.getstatusoutput(command)
+
+        if result[1].find("** server can't find")==-1:
+
+            # Found DC, extract names
+            sec = 'service = 0 100 389 '
+            lines = result[1].split('\n')
+            for line in lines:
+                loc = line.find(sec)
+                if loc>0:
+                    dc_name = line[loc+len(sec):-1]
+                    self.foundDC_q.put(dc_name)
+                    
+                    # Check if ports open
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(10)
+                    ports_to_scan = [389, 100]
+                    open_ports = []
+                    for port in ports_to_scan:
+                        result = sock.connect_ex((dc_name,port))
+                        if result == 0:
+                            open_ports.append(str(port))
+
+                    # Print out finding
+                    if len(open_ports)>0:
+                        print dc_name+" | Open ports: "+' '.join(open_ports)
+                    else:
+                        print dc_name+" | No open ports"
+
+
     def run(self):
 
         domains_to_check = self.domains_for_thread
@@ -125,6 +161,9 @@ class lookup(Thread):
                 addr = self.check(test)
                 if addr and addr != self.wildcard:
                     self.out_q.put(test)
+                    #Check if DC
+                    self.check_DC(test)
+
 
 
         # Done
@@ -197,6 +236,9 @@ def run_target(domains, subdomains, resolve_list, thread_count):
     # All get same output queue
     out_q = queue.Queue()
 
+    # Create queue for DC checking
+    foundDC_q = queue.Queue()
+
     # Split up domains across threads
     domains_for_thread = list(create(thread_count))
     if len(domains)<thread_count:# Error check
@@ -217,7 +259,7 @@ def run_target(domains, subdomains, resolve_list, thread_count):
         step_size = 1
     step = 0
     for i in range(thread_count):
-        threads.append( lookup( domains_for_thread[i], out_q, subdomains, wildcard , resolve_list[step:step + step_size]))
+        threads.append( lookup( domains_for_thread[i], out_q, foundDC_q, subdomains, wildcard , resolve_list[step:step + step_size]  ))
         threads[-1].start()
     step += step_size
     if step >= len(resolve_list):
@@ -231,9 +273,11 @@ def run_target(domains, subdomains, resolve_list, thread_count):
             if not d:
                 threads_remaining -= 1
             else:
-                print(d)
+                #print(d)
+                pass
         except queue.Empty:
             pass
+            
         #make sure everyone is complete
         if threads_remaining <= 0:
             break

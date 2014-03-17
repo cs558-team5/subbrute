@@ -1,2 +1,9 @@
+admin
 win
 apple
+vsdc1
+vsdc2
+apollo
+home
+vsdc1.asp
+ns2
