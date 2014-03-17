@@ -23,16 +23,23 @@ except:
 def killme(signum = 0, frame = 0):
     os.kill(os.getpid(), 9)
 
-class lookup(Thread):
+def create(n, constructor=list):
+    for _ in xrange(n):
+        yield constructor()
 
-    def __init__(self, in_q, out_q, domain, wildcard = False, resolver_list = []):
+class lookup(Thread):
+    def __init__(self, domains_for_thread, out_q, subdomains, wildcard = False, resolver_list = []):
         Thread.__init__(self)
-        self.in_q = in_q
         self.out_q = out_q
-        self.domain = domain
+        self.domains_for_thread = domains_for_thread
         self.wildcard = wildcard
         self.resolver_list = resolver_list
         self.resolver = dns.resolver.Resolver()
+        self.subdomains = subdomains
+        self.resolver.lifetime = 1.0
+        self.resolver.timeout = 0.5
+
+
         if len(self.resolver.nameservers):
             self.backup_resolver = self.resolver.nameservers
         else:
@@ -40,6 +47,9 @@ class lookup(Thread):
             self.backup_resolver = ['127.0.0.1']
         if len(self.resolver_list):
             self.resolver.nameservers = self.resolver_list
+
+
+
 
     def check(self, host):
         slept = 0
@@ -51,52 +61,75 @@ class lookup(Thread):
                 else:
                     return False
             except Exception as e:
-                if type(e) == dns.resolver.NXDOMAIN:
+
+                if type(e) == dns.resolver.Timeout:
+                    #print "Timeout"
+                    return False
+                elif type(e) == dns.resolver.NoAnswer:
+                    #print "NoAnswer"
+                    return False
+                elif type(e) == dns.resolver.NXDOMAIN:
                     #not found
                     return False
-                elif type(e) == dns.resolver.NoAnswer  or type(e) == dns.resolver.Timeout:
-                    if slept == 4:
-                        #This dns server stopped responding.
-                        #We could be hitting a rate limit.
-                        if self.resolver.nameservers == self.backup_resolver:
-                            #if we are already using the backup_resolver use the resolver_list
-                            self.resolver.nameservers = self.resolver_list
-                        else:
-                            #fall back on the system's dns name server
-                            self.resolver.nameservers = self.backup_resolver
-                    elif slept > 5:
-                        #hmm the backup resolver didn't work, 
-                        #so lets go back to the resolver_list provided.
-                        #If the self.backup_resolver list did work, lets stick with it.
-                        self.resolver.nameservers = self.resolver_list
-                        #I don't think we are ever guaranteed a response for a given name.
-                        return False
-                    #Hmm,  we might have hit a rate limit on a resolver.
-                    time.sleep(1)
-                    slept += 1
-                    #retry...
-                elif type(e) == IndexError:
-                    #Some old versions of dnspython throw this error,
-                    #doesn't seem to affect the results,  and it was fixed in later versions.
-                    pass
                 else:
-                    #dnspython threw some strange exception...
-                    raise e
+                    return False
+
+                # if type(e) == dns.resolver.NXDOMAIN:
+                #     #not found
+                #     return False
+                # elif type(e) == dns.resolver.NoAnswer  or type(e) == dns.resolver.Timeout:
+                #     if slept == 4:
+                #         #This dns server stopped responding.
+                #         #We could be hitting a rate limit.
+                #         if self.resolver.nameservers == self.backup_resolver:
+                #             #if we are already using the backup_resolver use the resolver_list
+                #             self.resolver.nameservers = self.resolver_list
+                #         else:
+                #             #fall back on the system's dns name server
+                #             self.resolver.nameservers = self.backup_resolver
+                #     elif slept > 5:
+                #         #hmm the backup resolver didn't work, 
+                #         #so lets go back to the resolver_list provided.
+                #         #If the self.backup_resolver list did work, lets stick with it.
+                #         self.resolver.nameservers = self.resolver_list
+                #         #I don't think we are ever guaranteed a response for a given name.
+                #         return False
+                #     #Hmm,  we might have hit a rate limit on a resolver.
+                #     time.sleep(1)
+                #     slept += 1
+                #     #retry...
+                # elif type(e) == IndexError:
+                #     #Some old versions of dnspython throw this error,
+                #     #doesn't seem to affect the results,  and it was fixed in later versions.
+                #     pass
+                # else:
+                #     #dnspython threw some strange exception...
+                #     raise e
 
     def run(self):
-        while True:
-            sub = self.in_q.get()
-            if not sub:
-                #Perpetuate the terminator for all threads to see
-                self.in_q.put(False)
-                #Notify the parent of our death of natural causes.
-                self.out_q.put(False)
-                break
-            else:
-                test = "%s.%s" % (sub, self.domain)
+
+        domains_to_check = self.domains_for_thread
+        subdomains = self.subdomains
+
+        for subdomain in subdomains:
+
+            if subdomain=='':
+                continue
+
+            for domain in domains_to_check:
+                if domain == '':
+                    continue
+
+                test = "%s.%s" % (subdomain, domain)
+                #print "Checking: "+test
                 addr = self.check(test)
                 if addr and addr != self.wildcard:
                     self.out_q.put(test)
+
+
+        # Done
+        self.out_q.put(False)
+
 
 #Return a list of unique sub domains,  sorted by frequency.
 def extract_subdomains(file_name):
@@ -134,6 +167,10 @@ def extract_subdomains(file_name):
 def check_resolvers(file_name):
     ret = []
     resolver = dns.resolver.Resolver()
+
+    # Change default timeout
+    resolver.lifetime = 1.0
+
     res_file = open(file_name).read()
     for server in res_file.split("\n"):
         server = server.strip()
@@ -147,28 +184,40 @@ def check_resolvers(file_name):
                 pass
     return ret
 
-def run_target(target, hosts, resolve_list, thread_count):
+def run_target(domains, subdomains, resolve_list, thread_count):
     #The target might have a wildcard dns record...
     wildcard = False
     try:
 
-        resp = dns.resolver.Resolver().query("would-never-be-a-fucking-domain-name-" + str(random.randint(1, 9999)) + "." + target)
+        resp = dns.resolver.Resolver().query("would-never-be-a-domain-name-" + str(random.randint(1, 9999)) + "." + domains[0])
         wildcard = str(resp[0])
     except:
         pass
-    in_q = queue.Queue()
+
+    # All get same output queue
     out_q = queue.Queue()
-    for h in hosts:
-        in_q.put(h)
+
+    # Split up domains across threads
+    domains_for_thread = list(create(thread_count))
+    if len(domains)<thread_count:# Error check
+        print "Domains < Threads"
+        sys.exit(1)
+    else:
+        for i in range(len(domains)):
+            target_thread = i % thread_count
+            domains_for_thread[ target_thread ].append( domains[i] )
+
+
+
+
     #Terminate the queue
-    in_q.put(False)
     step_size = int(len(resolve_list) / thread_count)
     #Split up the resolver list between the threads. 
     if step_size <= 0:
         step_size = 1
     step = 0
     for i in range(thread_count):
-        threads.append(lookup(in_q, out_q, target, wildcard , resolve_list[step:step + step_size]))
+        threads.append( lookup( domains_for_thread[i], out_q, subdomains, wildcard , resolve_list[step:step + step_size]))
         threads[-1].start()
     step += step_size
     if step >= len(resolve_list):
@@ -219,13 +268,20 @@ if __name__ == "__main__":
     else:
         targets = args #multiple arguments on the cli:  ./subbrute.py google.com gmail.com yahoo.com
 
-    hosts = open(options.subs).read().split("\n")
+    subdomains = open(options.subs).read().split("\n")
 
     resolve_list = check_resolvers(options.resolvers)
     threads = []
     signal.signal(signal.SIGINT, killme)
 
-    for target in targets:
-        target = target.strip()
-        if target:
-            run_target(target, hosts, resolve_list, options.thread_count)
+    # Run across all domains, targets are domains we are looking across
+    run_target(targets, subdomains, resolve_list, options.thread_count)
+
+
+
+
+
+
+
+
+
